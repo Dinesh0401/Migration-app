@@ -205,9 +205,9 @@ class CDCWorkerManager:
                     if events:
                         print(f"\n-------------------------------------------------------", flush=True)
                         for ev in events:
-                            op = ev.operation.value.upper()
+                            op = str(getattr(ev.operation, "value", ev.operation)).upper()
                             print(f"[CDC] {op} detected", flush=True)
-                            print(f"[CDC] SCN: {ev.scn} | Table: {ev.table_name} | PK: {ev.primary_key}", flush=True)
+                            print(f"[CDC] SCN: {ev.scn} | Table: {ev.source_table} | PK: {ev.primary_key}", flush=True)
 
                         result = csm.process_events(
                             events=events,

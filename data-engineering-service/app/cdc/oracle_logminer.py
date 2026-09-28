@@ -185,34 +185,43 @@ class OracleLogMinerCDCSource(BaseCDCSource):
                 logger.info(f"[LogMiner] Started session for SCN {start_scn} -> {end_scn}")
 
                 # 5. Query V$LOGMNR_CONTENTS
-                # In multitenant Oracle, isolate changes from the configured PDB
-                target_pdb = self.config.ORACLE_SERVICE.upper()
-                where_clauses = ["OPERATION IN ('INSERT', 'UPDATE', 'DELETE')"]
-                params: dict[str, Any] = {}
-
-                # Check if SRC_CON_NAME column is present
                 cols = set(conn.execute(text("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = 'V_$LOGMNR_CONTENTS'")).scalars().all())
-                if "SRC_CON_NAME" in cols and target_pdb != "FREE":
-                    where_clauses.append("SRC_CON_NAME = :pdb_name")
-                    params["pdb_name"] = target_pdb
 
-                if table_filter:
-                    formatted_tables = [t.upper().strip() for t in table_filter]
-                    tables_list = ", ".join([f"'{t}'" for t in formatted_tables])
-                    where_clauses.append(f"UPPER(TABLE_NAME) IN ({tables_list})")
+                # TEMPORARY DIAGNOSTIC:
+                # Do not filter SRC_CON_NAME yet.
+                # We first want to see whether LogMiner is capturing
+                # any DML from the redo logs at all.
+                src_con_col = ", SRC_CON_NAME" if "SRC_CON_NAME" in cols else ""
 
-                where_sql = " AND ".join(where_clauses)
                 query = f"""
-                SELECT SCN, TIMESTAMP, OPERATION, SEG_OWNER, TABLE_NAME, SQL_REDO, RS_ID, SSN, XID, ROW_ID
+                SELECT SCN, TIMESTAMP, OPERATION, SEG_OWNER, TABLE_NAME, SQL_REDO, RS_ID, SSN, XID, ROW_ID{src_con_col}
                 FROM V$LOGMNR_CONTENTS
-                WHERE {where_sql}
+                WHERE OPERATION IN ('INSERT', 'UPDATE', 'DELETE')
                 ORDER BY SCN, RS_ID, SSN
                 """
 
-                rows = conn.execute(text(query), params).mappings().all()
+                rows = conn.execute(text(query)).mappings().all()
+
+                if rows:
+                    for row in rows[:10]:
+                        logger.info(
+                            "[LogMiner DEBUG] SCN=%s OP=%s OWNER=%s TABLE=%s CON=%s SQL=%s",
+                            row.get("SCN"),
+                            row.get("OPERATION"),
+                            row.get("SEG_OWNER"),
+                            row.get("TABLE_NAME"),
+                            row.get("SRC_CON_NAME"),
+                            row.get("SQL_REDO"),
+                        )
+                else:
+                    logger.info("[LogMiner DEBUG] No DML rows returned from V$LOGMNR_CONTENTS")
+
                 logger.info(f"[LogMiner] Extracted {len(rows)} raw DML change records from redo logs.")
 
                 for idx, row in enumerate(rows, start=1):
+                    tbl = str(row.get("TABLE_NAME") or "").upper()
+                    if table_filter and tbl not in [t.upper().strip() for t in table_filter]:
+                        continue
                     event = self.normalizer.normalize_row(dict(row))
                     if event:
                         event.sequence = idx
