@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, Connection
 
 from app.adapters.registry import default_registry
 from app.adapters.postgres_adapter import PostgresTargetAdapter
@@ -17,6 +17,14 @@ class PostgresCDCWriter:
     Idempotent PostgreSQL writer for normalized CDC events.
     Applies INSERT, UPDATE, and DELETE operations using primary keys.
     Supports PostgreSQL UPSERT (ON CONFLICT DO UPDATE) for idempotent delivery.
+
+    ARCHITECTURAL LIMITATION NOTE:
+    CDC replay is fully idempotent ONLY when target tables have a stable primary key.
+    Without a primary key:
+      - INSERT replay may duplicate rows (fallback is raw INSERT without ON CONFLICT).
+      - DELETE cannot reliably identify target rows (raises ValueError).
+    This is an inherent relational CDC constraint; target tables must define a primary key
+    for lossless, idempotent replay.
     """
 
     def __init__(self, target_adapter: PostgresTargetAdapter | None = None) -> None:
@@ -89,10 +97,12 @@ class PostgresCDCWriter:
         target_table: str,
         target_schema: str = "public",
         transformed_row: dict[str, Any] | None = None,
+        conn: Connection | None = None,
     ) -> bool:
         """
         Applies a single CDCEvent to PostgreSQL.
         Returns True on successful apply, raises exception on failure.
+        Accepts optional transaction connection `conn` for atomic multi-event transactions.
         """
         op = str(event.operation).upper()
         if op == CDCOperation.DDL.value:
@@ -111,9 +121,9 @@ class PostgresCDCWriter:
         mapped_data = self._map_payload_to_target(payload, target_columns)
 
         if op in (CDCOperation.INSERT.value, CDCOperation.UPDATE.value):
-            return self._apply_upsert(target_table, target_schema, mapped_data, pk_columns)
+            return self._apply_upsert(target_table, target_schema, mapped_data, pk_columns, conn=conn)
         elif op == CDCOperation.DELETE.value:
-            return self._apply_delete(target_table, target_schema, mapped_data, event.primary_key, pk_columns)
+            return self._apply_delete(target_table, target_schema, mapped_data, event.primary_key, pk_columns, conn=conn)
         else:
             logger.warning(f"[TARGET] Unsupported CDC operation '{op}' at SCN {event.scn}")
             return False
@@ -124,6 +134,7 @@ class PostgresCDCWriter:
         schema: str,
         data: dict[str, Any],
         pk_columns: list[str],
+        conn: Connection | None = None,
     ) -> bool:
         if not data:
             logger.warning(f"[TARGET] Empty data payload for upsert into {schema}.{table}")
@@ -155,14 +166,19 @@ class PostgresCDCWriter:
                 ON CONFLICT ({pk_names}) DO NOTHING;
                 """
         else:
-            # Fallback when no PK detected on target
+            # Fallback when no PK detected on target:
+            # NOTE: Without a primary key, ON CONFLICT cannot be constructed.
+            # Replay of an INSERT event will append a duplicate row.
             sql = f"""
             INSERT INTO "{schema}"."{table}" ({col_names})
             VALUES ({param_names});
             """
 
-        with self.get_engine().begin() as conn:
+        if conn is not None:
             conn.execute(text(sql), data)
+        else:
+            with self.get_engine().begin() as c:
+                c.execute(text(sql), data)
         return True
 
     def _apply_delete(
@@ -172,6 +188,7 @@ class PostgresCDCWriter:
         data: dict[str, Any],
         event_pk: dict[str, Any],
         pk_columns: list[str],
+        conn: Connection | None = None,
     ) -> bool:
         # Build where condition from primary key
         where_parts: list[str] = []
@@ -199,11 +216,15 @@ class PostgresCDCWriter:
                 params[clean_k] = v
 
         if not where_parts:
+            # NOTE: Without a primary key, individual rows cannot be reliably identified for deletion.
             raise ValueError(f"Cannot execute DELETE on {schema}.{table}: No primary key identified.")
 
         where_sql = " AND ".join(where_parts)
         sql = f'DELETE FROM "{schema}"."{table}" WHERE {where_sql};'
 
-        with self.get_engine().begin() as conn:
+        if conn is not None:
             conn.execute(text(sql), params)
+        else:
+            with self.get_engine().begin() as c:
+                c.execute(text(sql), params)
         return True

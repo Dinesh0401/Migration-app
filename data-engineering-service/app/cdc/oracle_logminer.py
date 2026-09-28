@@ -4,6 +4,7 @@ import logging
 from typing import Any
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from app.cdc.base import BaseCDCSource
 from app.cdc.models import CDCEvent
@@ -28,6 +29,7 @@ class OracleLogMinerCDCSource(BaseCDCSource):
     ) -> None:
         self.config = config or settings
         self.normalizer = normalizer or LogMinerNormalizer()
+        self.last_raw_rows_count: int = 0
         self._engine: Engine | None = None
         self._cdb_engine: Engine | None = None
 
@@ -44,15 +46,18 @@ class OracleLogMinerCDCSource(BaseCDCSource):
         In Oracle multitenant, online redo logs belong to CDB$ROOT.
         If ORACLE_CDB_SERVICE is available, connects to CDB root;
         otherwise falls back to source URL.
+        Uses NullPool to guarantee that each LogMiner session completely frees
+        process PGA memory upon closing.
         """
         if self._cdb_engine is None:
             try:
                 cdb_url = self.config.get_oracle_cdb_url()
-                self._cdb_engine = create_engine(cdb_url, pool_pre_ping=True)
+                self._cdb_engine = create_engine(cdb_url, poolclass=NullPool)
             except Exception as exc:
                 logger.warning(f"Could not initialize CDB engine ({exc}), using standard engine.")
                 self._cdb_engine = self.get_source_engine()
         return self._cdb_engine
+
 
     def get_current_scn(self) -> int:
         """Retrieves the current SCN from Oracle."""
@@ -61,6 +66,19 @@ class OracleLogMinerCDCSource(BaseCDCSource):
             if scn is None:
                 raise RuntimeError("Failed to retrieve CURRENT_SCN from Oracle V$DATABASE.")
             return int(scn)
+
+    def get_oldest_active_transaction_scn(self) -> int | None:
+        """
+        Inspects V$TRANSACTION for active (uncommitted) transactions.
+        Returns the lowest START_SCN among in-flight transactions,
+        or None if there are no active transactions.
+        Raises an exception if the query fails so callers can fail closed.
+        """
+        with self.get_logminer_engine().connect() as conn:
+            min_scn = conn.execute(
+                text("SELECT MIN(START_SCN) FROM V$TRANSACTION WHERE STATUS = 'ACTIVE'")
+            ).scalar()
+            return int(min_scn) if min_scn is not None else None
 
     def check_prerequisites(self) -> dict[str, Any]:
         """
@@ -148,6 +166,7 @@ class OracleLogMinerCDCSource(BaseCDCSource):
             return []
 
         logger.info(f"[LogMiner] Reading changes in SCN window [{start_scn} -> {end_scn}]")
+        self.last_raw_rows_count = 0
         engine = self.get_logminer_engine()
         events: list[CDCEvent] = []
 
@@ -187,31 +206,43 @@ class OracleLogMinerCDCSource(BaseCDCSource):
                 # 5. Query V$LOGMNR_CONTENTS
                 cols = set(conn.execute(text("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = 'V_$LOGMNR_CONTENTS'")).scalars().all())
 
-                # TEMPORARY DIAGNOSTIC:
-                # Do not filter SRC_CON_NAME yet.
-                # We first want to see whether LogMiner is capturing
-                # any DML from the redo logs at all.
-                src_con_col = ", SRC_CON_NAME" if "SRC_CON_NAME" in cols else ""
+                # In multitenant Oracle, isolate changes from the configured PDB
+                target_pdb = self.config.ORACLE_SERVICE.upper()
+                where_clauses = ["OPERATION IN ('INSERT', 'UPDATE', 'DELETE')"]
+                params: dict[str, Any] = {}
 
+                src_con_col = ", SRC_CON_NAME" if "SRC_CON_NAME" in cols else ""
+                commit_scn_col = ", COMMIT_SCN" if "COMMIT_SCN" in cols else ""
+                if "SRC_CON_NAME" in cols and target_pdb not in ("FREE", "CDB$ROOT"):
+                    where_clauses.append("SRC_CON_NAME = :pdb_name")
+                    params["pdb_name"] = target_pdb
+
+                if table_filter:
+                    formatted_tables = [t.upper().strip() for t in table_filter]
+                    tables_list = ", ".join([f"'{t}'" for t in formatted_tables])
+                    where_clauses.append(f"UPPER(TABLE_NAME) IN ({tables_list})")
+
+                where_sql = " AND ".join(where_clauses)
                 query = f"""
-                SELECT SCN, TIMESTAMP, OPERATION, SEG_OWNER, TABLE_NAME, SQL_REDO, RS_ID, SSN, XID, ROW_ID{src_con_col}
+                SELECT SCN, TIMESTAMP, OPERATION, SEG_OWNER, TABLE_NAME, SQL_REDO, RS_ID, SSN, XID, ROW_ID{src_con_col}{commit_scn_col}
                 FROM V$LOGMNR_CONTENTS
-                WHERE OPERATION IN ('INSERT', 'UPDATE', 'DELETE')
+                WHERE {where_sql}
                 ORDER BY SCN, RS_ID, SSN
                 """
 
-                rows = conn.execute(text(query)).mappings().all()
+                rows = conn.execute(text(query), params).mappings().all()
+                self.last_raw_rows_count = len(rows)
 
                 if rows:
                     for row in rows[:10]:
                         logger.info(
                             "[LogMiner DEBUG] SCN=%s OP=%s OWNER=%s TABLE=%s CON=%s SQL=%s",
-                            row.get("SCN"),
-                            row.get("OPERATION"),
-                            row.get("SEG_OWNER"),
-                            row.get("TABLE_NAME"),
-                            row.get("SRC_CON_NAME"),
-                            row.get("SQL_REDO"),
+                            row.get("SCN") or row.get("scn"),
+                            row.get("OPERATION") or row.get("operation"),
+                            row.get("SEG_OWNER") or row.get("seg_owner"),
+                            row.get("TABLE_NAME") or row.get("table_name"),
+                            row.get("SRC_CON_NAME") or row.get("src_con_name"),
+                            row.get("SQL_REDO") or row.get("sql_redo"),
                         )
                 else:
                     logger.info("[LogMiner DEBUG] No DML rows returned from V$LOGMNR_CONTENTS")
@@ -219,7 +250,7 @@ class OracleLogMinerCDCSource(BaseCDCSource):
                 logger.info(f"[LogMiner] Extracted {len(rows)} raw DML change records from redo logs.")
 
                 for idx, row in enumerate(rows, start=1):
-                    tbl = str(row.get("TABLE_NAME") or "").upper()
+                    tbl = str(row.get("TABLE_NAME") or row.get("table_name") or "").upper()
                     if table_filter and tbl not in [t.upper().strip() for t in table_filter]:
                         continue
                     event = self.normalizer.normalize_row(dict(row))

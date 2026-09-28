@@ -219,6 +219,9 @@ class LogMinerNormalizer:
                 first_k = next(iter(data_for_pk))
                 primary_key[first_k] = data_for_pk[first_k]
 
+        raw_commit_scn = row.get("commit_scn") or row.get("COMMIT_SCN")
+        commit_scn = int(raw_commit_scn) if raw_commit_scn is not None else None
+
         return CDCEvent(
             scn=scn,
             operation=op,
@@ -230,4 +233,5 @@ class LogMinerNormalizer:
             timestamp=ts,
             transaction_id=tx_id,
             raw_sql=sql_redo,
+            commit_scn=commit_scn,
         )

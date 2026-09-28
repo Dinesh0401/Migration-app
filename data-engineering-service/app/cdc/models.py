@@ -33,6 +33,7 @@ class CDCEvent:
     transaction_id: str | None = None
     raw_sql: str | None = None
     sequence: int = 0
+    commit_scn: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.operation, CDCOperation):
@@ -41,7 +42,7 @@ class CDCEvent:
             self.operation = str(self.operation).upper()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "scn": self.scn,
             "operation": self.operation,
             "source_schema": self.source_schema,
@@ -54,6 +55,9 @@ class CDCEvent:
             "raw_sql": self.raw_sql,
             "sequence": self.sequence,
         }
+        if self.commit_scn is not None:
+            d["commit_scn"] = self.commit_scn
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CDCEvent:
@@ -69,6 +73,7 @@ class CDCEvent:
             transaction_id=data.get("transaction_id"),
             raw_sql=data.get("raw_sql"),
             sequence=int(data.get("sequence", 0)),
+            commit_scn=data.get("commit_scn"),
         )
 
 
