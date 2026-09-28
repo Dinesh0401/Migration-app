@@ -8,6 +8,7 @@ from app.cdc.oracle_logminer import OracleLogMinerCDCSource
 from app.cdc.consumer import CDCConsumer
 from app.cdc.checkpoint import PostgresCheckpointStore
 from app.cdc.models import CDCStatus, CDCWindowResult
+from app.cdc.worker import default_worker_manager
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,36 @@ class CDCService:
             "ready": is_ready,
         }
 
+    def is_running(self, pipeline_name: str = "oracle_to_postgres_cdc") -> bool:
+        """Returns True if the background worker thread is actively polling."""
+        return default_worker_manager.is_running(pipeline_name)
+
+    def start_worker(
+        self,
+        pipeline_name: str = "oracle_to_postgres_cdc",
+        poll_interval_seconds: float = 2.0,
+        table_filter: list[str] | None = None,
+        transformations: list[dict[str, Any]] | None = None,
+        target_table: str = "employees",
+        target_schema: str = "public",
+    ) -> dict[str, Any]:
+        """Starts continuous background CDC polling in a daemon thread."""
+        return default_worker_manager.start_worker(
+            pipeline_name=pipeline_name,
+            poll_interval_seconds=poll_interval_seconds,
+            table_filter=table_filter,
+            transformations=transformations,
+            target_table=target_table,
+            target_schema=target_schema,
+            source=self.source,
+            consumer=self.consumer,
+            checkpoint_store=self.checkpoint_store,
+        )
+
+    def stop_worker(self, pipeline_name: str = "oracle_to_postgres_cdc", timeout: float = 5.0) -> dict[str, Any]:
+        """Stops the active background CDC worker."""
+        return default_worker_manager.stop_worker(pipeline_name=pipeline_name, timeout=timeout)
+
     def get_status(self, pipeline_name: str = "oracle_to_postgres_cdc") -> dict[str, Any]:
         """Returns the current CDC status, SCN offsets, and replication lag."""
         checkpoint_info = self.checkpoint_store.get_checkpoint_info(pipeline_name)
@@ -62,14 +93,21 @@ class CDCService:
         if last_scn is not None and current_ora_scn is not None:
             lag = max(0, current_ora_scn - last_scn)
 
-        return CDCStatus(
+        is_alive = self.is_running(pipeline_name)
+
+        status_dict = CDCStatus(
             pipeline_name=pipeline_name,
             last_checkpoint_scn=last_scn,
             current_oracle_scn=current_ora_scn,
             lag_scn=lag,
             updated_at=checkpoint_info.get("updated_at"),
-            is_running=False,
+            is_running=is_alive,
         ).to_dict()
+
+        if is_alive:
+            status_dict["worker"] = default_worker_manager.get_stats(pipeline_name)
+
+        return status_dict
 
     def get_checkpoint(self, pipeline_name: str = "oracle_to_postgres_cdc") -> dict[str, Any]:
         """Returns checkpoint details for the specified pipeline."""

@@ -220,7 +220,7 @@ def run_demo() -> None:
     }
     migration_service = MigrationService()
     batch_res = migration_service.run_migration(batch_contract)
-    print(f"[+] Batch baseline migration result: {batch_res.get('status')} | Loaded {batch_res.get('rows_inserted')} rows.")
+    print(f"[+] Batch baseline migration result: {batch_res.get('status')} | Loaded {batch_res.get('loaded_rows')} rows.")
     baseline_pg_df = pg_adapter.verify_data("employees", "public")
     print("PostgreSQL state after batch baseline:")
     print(baseline_pg_df.to_string(index=False))
