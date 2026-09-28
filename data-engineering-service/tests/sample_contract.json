@@ -1,0 +1,22 @@
+{
+  "source": "oracle",
+  "target": "postgresql",
+  "execution_options": {
+    "allow_destructive_ddl": true
+  },
+  "table_management": [
+    "CREATE TABLE IF NOT EXISTS public.pipeline_custom_test (code VARCHAR(20), label VARCHAR(50), num_val INT);",
+    "TRUNCATE TABLE public.pipeline_custom_test;"
+  ],
+  "data_extraction": [
+    "SELECT 'ALPHA' AS CODE, '  First Sample Item  ' AS RAW_LABEL, 42 AS NUM_VAL FROM DUAL UNION ALL SELECT 'BETA', '  Second Sample Item  ', 100 FROM DUAL"
+  ],
+  "transformations": [
+    {"type": "normalize_columns", "case": "lower"},
+    {"type": "trim", "source": "raw_label", "target": "label"}
+  ],
+  "data_management": [
+    "INSERT INTO public.pipeline_custom_test (code, label, num_val) VALUES {VALUES_PLACEHOLDER};"
+  ],
+  "placeholder": "{VALUES_PLACEHOLDER}"
+}

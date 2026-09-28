@@ -1,0 +1,18 @@
+backend/node_modules
+backend/dist
+backend/.env
+frontend/node_modules
+frontend/dist
+
+# Data migration generated files and local credentials
+Data_Migration/node_modules
+Data_Migration/dist
+Data_Migration/.env
+
+# Preserve the nested repository outside the parent repository
+Data_Migration/.git.nested-backup
+
+# Local environment files
+**/.env
+**/.env.*
+!.env.example

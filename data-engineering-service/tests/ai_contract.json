@@ -1,0 +1,31 @@
+{
+  "provider": "gemini",
+  "result": {
+    "source": {
+      "type": "oracle"
+    },
+    "target": {
+      "type": "postgresql"
+    },
+    "execution_options": {
+      "allow_destructive_ddl": true
+    },
+    "table_management": [
+      "CREATE TABLE IF NOT EXISTS public.ai_migration_demo (id INT PRIMARY KEY, name VARCHAR(100), category VARCHAR(50), amount NUMERIC(10,2));",
+      "TRUNCATE TABLE public.ai_migration_demo;"
+    ],
+    "data_extraction": [
+      "SELECT 101 AS ID, '  john doe  ' AS RAW_NAME, 'finance' AS CATEGORY, 1250.75 AS AMOUNT FROM DUAL UNION ALL SELECT 102, '  jane smith  ', 'engineering', 2450.50 FROM DUAL UNION ALL SELECT 103, '  bob wilson  ', 'engineering', 1890.00 FROM DUAL"
+    ],
+    "transformations": [
+      {"type": "normalize_columns", "case": "lower"},
+      {"type": "normalize", "source": "raw_name", "target": "name", "case": "title", "strip": true},
+      {"type": "normalize", "source": "category", "case": "upper", "strip": true}
+    ],
+    "data_management": [
+      "INSERT INTO public.ai_migration_demo (id, name, category, amount) VALUES {VALUES_PLACEHOLDER};"
+    ],
+    "placeholder": "{VALUES_PLACEHOLDER}",
+    "summary": "AI generated migration contract for Oracle to PostgreSQL demonstration"
+  }
+}
