@@ -22,7 +22,7 @@ class CDCWorkerManager:
     """
 
     _instance: CDCWorkerManager | None = None
-    _lock = threading.Lock()
+    _lock = threading.RLock()
 
     def __new__(cls) -> CDCWorkerManager:
         with cls._lock:
@@ -33,7 +33,7 @@ class CDCWorkerManager:
 
     def _init_manager(self) -> None:
         self.workers: dict[str, dict[str, Any]] = {}
-        self.worker_lock = threading.Lock()
+        self.worker_lock = threading.RLock()
 
     def is_running(self, pipeline_name: str = "oracle_to_postgres_cdc") -> bool:
         with self.worker_lock:
