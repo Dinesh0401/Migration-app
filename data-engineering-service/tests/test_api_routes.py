@@ -59,3 +59,37 @@ def test_api_run_migration_success():
         data = response.json()
         assert data["status"] == "success"
         assert data["target_rows"] == 5
+
+
+def test_api_validate_endpoint():
+    spec = {
+        "source": {"type": "oracle", "schema": "HR"},
+        "target": {"type": "postgresql", "schema": "public"},
+        "data_migration": {
+            "extraction": {"query": "SELECT * FROM EMPLOYEES"},
+            "loading": {"table": "employees", "columns": ["id"]},
+        },
+    }
+    response = client.post("/migration/validate", json=spec)
+    assert response.status_code == 200
+    assert response.json()["valid"] is True
+
+
+def test_api_transform_endpoint():
+    payload = {
+        "data": [
+            {"NAME": "  john doe  ", "SALARY": 5000},
+            {"NAME": "  jane smith  ", "SALARY": 6000},
+        ],
+        "transformations": [
+            {"type": "normalize_columns", "case": "lower"},
+            {"type": "normalize", "source": "name", "target": "name", "case": "title", "strip": True},
+        ],
+    }
+    response = client.post("/migration/transform", json=payload)
+    assert response.status_code == 200
+    res = response.json()
+    assert res["status"] == "success"
+    assert res["transformed_rows"] == 2
+    assert res["sample"][0]["name"] == "John Doe"
+
