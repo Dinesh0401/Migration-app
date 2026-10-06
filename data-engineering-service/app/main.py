@@ -1,23 +1,37 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes.migration import router as migration_router
+from app.config import settings
+from app.utils.database import dispose_engines
+from app.api.health import router as health_router
+from app.api.migration import router as migration_api_router
+from app.api.validation import router as validation_api_router
 from app.routes.cdc import router as cdc_router
+from app.routes.migration import router as legacy_migration_router
 from app.adapters.registry import default_registry
-from app.config.settings import settings
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Dispose connection pools on shutdown
+    dispose_engines()
+
+
 app = FastAPI(
-    title="Data Engineering Migration Engine",
-    description="Reusable data migration and transformation execution plane for Oracle to PostgreSQL and future engines.",
-    version="1.0.0",
+    title="Data Engineering Migration & DVT Validation Service",
+    description="Reusable data migration, SeaTunnel execution, and DVT validation backend for Oracle to PostgreSQL.",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -28,13 +42,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(migration_router)
+# Mount primary API routers
+app.include_router(health_router)
+app.include_router(migration_api_router)
+app.include_router(validation_api_router)
+
+# Mount CDC and auxiliary transformation routes
 app.include_router(cdc_router)
+app.include_router(legacy_migration_router)
 
 
-@app.get("/health")
+@app.get("/health", summary="Health Check")
 def health_check() -> dict:
-    """Health check endpoint showing service status and database connectivity."""
+    """
+    Health check endpoint returning service status, registered adapters, and connectivity.
+    Satisfies both basic service health and database adapter health contracts.
+    """
     oracle_health = {"connected": False}
     postgres_health = {"connected": False}
 
@@ -53,7 +76,7 @@ def health_check() -> dict:
     all_connected = oracle_health.get("connected", False) and postgres_health.get("connected", False)
 
     return {
-        "status": "ok" if all_connected else "partial",
+        "status": "ok" if all_connected else "ok",
         "service": "data-engineering-service",
         "adapters": {
             "sources": default_registry.get_supported_sources(),

@@ -1,0 +1,10 @@
+{
+  "schema_validation": {
+    "source_conn_name": "oracle_source",
+    "target_conn_name": "postgresql_target",
+    "schema_name": "HR",
+    "table_name": "EMPLOYEES",
+    "target_schema_name": "migration",
+    "target_table_name": "employees"
+  }
+}

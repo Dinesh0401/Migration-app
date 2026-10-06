@@ -216,18 +216,167 @@ def validate_migration_contract(spec: dict[str, Any]) -> tuple[bool, list[str]]:
     return len(errors) == 0, errors
 
 
+def validate_records(
+    records: list[dict[str, Any]] | list[tuple[Any, ...]],
+    column_names: list[str] | None = None,
+    required_columns: list[str] | None = None,
+    primary_key: str | list[str] | None = None,
+    expected_dtypes: dict[str, str] | None = None,
+    allow_empty: bool = True,
+) -> dict[str, Any]:
+    """
+    Validates in-memory records (lists of dicts or tuples) prior to loading into target database.
+    Implemented in Pure Python with ZERO dependency on Pandas.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if records is None:
+        return {
+            "valid": False,
+            "status": "failed",
+            "rows": 0,
+            "errors": ["Records collection is None."],
+            "warnings": [],
+        }
+
+    total_rows = len(records)
+    if total_rows == 0:
+        if not allow_empty:
+            errors.append("Dataset is empty; zero records found.")
+        return {
+            "valid": len(errors) == 0,
+            "status": "passed" if len(errors) == 0 else "failed",
+            "rows": 0,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    # Normalize records into list of dictionaries
+    dict_records: list[dict[str, Any]] = []
+    first_record = records[0]
+
+    if isinstance(first_record, dict):
+        dict_records = records  # type: ignore
+        detected_columns = list(first_record.keys())
+    elif isinstance(first_record, (tuple, list)):
+        if not column_names:
+            errors.append("column_names must be provided when records are given as tuples or lists.")
+            return {
+                "valid": False,
+                "status": "failed",
+                "rows": total_rows,
+                "errors": errors,
+                "warnings": warnings,
+            }
+        detected_columns = list(column_names)
+        dict_records = [dict(zip(column_names, row)) for row in records]
+    else:
+        errors.append(f"Unsupported record format: {type(first_record).__name__}. Expected dict or tuple.")
+        return {
+            "valid": False,
+            "status": "failed",
+            "rows": total_rows,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    col_map = {c.lower(): c for c in detected_columns}
+
+    if required_columns:
+        for req_col in required_columns:
+            if req_col.lower() not in col_map:
+                errors.append(f"Missing required column: '{req_col}'. Available columns: {detected_columns}")
+
+    if primary_key:
+        pk_cols = [primary_key] if isinstance(primary_key, str) else list(primary_key)
+        resolved_pks: list[str] = []
+        for pk in pk_cols:
+            if pk.lower() in col_map:
+                resolved_pks.append(col_map[pk.lower()])
+            else:
+                errors.append(f"Primary key column '{pk}' not found in record columns: {detected_columns}")
+
+        if len(resolved_pks) == len(pk_cols):
+            seen_pk_values: set[tuple[Any, ...]] = set()
+            null_pk_count = 0
+            duplicate_pk_count = 0
+
+            for row_idx, row in enumerate(dict_records):
+                pk_tuple = tuple(row.get(col) for col in resolved_pks)
+                if any(val is None for val in pk_tuple):
+                    null_pk_count += 1
+                    if null_pk_count <= 5:
+                        errors.append(f"Primary key column(s) {resolved_pks} contain NULL value at row #{row_idx + 1}: {pk_tuple}")
+                else:
+                    if pk_tuple in seen_pk_values:
+                        duplicate_pk_count += 1
+                        if duplicate_pk_count <= 5:
+                            errors.append(f"Duplicate primary key value detected on {resolved_pks} at row #{row_idx + 1}: {pk_tuple}")
+                    else:
+                        seen_pk_values.add(pk_tuple)
+
+            if null_pk_count > 5:
+                errors.append(f"... and {null_pk_count - 5} more NULL primary key occurrences.")
+            if duplicate_pk_count > 5:
+                errors.append(f"... and {duplicate_pk_count - 5} more duplicate primary key occurrences.")
+
+    if expected_dtypes:
+        for col_name, expected_type in expected_dtypes.items():
+            if col_name.lower() in col_map:
+                actual_col = col_map[col_name.lower()]
+                norm_type = expected_type.strip().lower()
+
+                type_mismatches = 0
+                for row_idx, row in enumerate(dict_records[:100]):
+                    val = row.get(actual_col)
+                    if val is None:
+                        continue
+
+                    valid_type = True
+                    if norm_type in ("int", "integer"):
+                        if isinstance(val, bool) or not isinstance(val, int):
+                            try:
+                                int(str(val))
+                            except (ValueError, TypeError):
+                                valid_type = False
+                    elif norm_type in ("float", "numeric", "decimal", "double"):
+                        if isinstance(val, bool) or not isinstance(val, (int, float)):
+                            try:
+                                float(str(val))
+                            except (ValueError, TypeError):
+                                valid_type = False
+                    elif norm_type in ("str", "string", "varchar", "text"):
+                        if not isinstance(val, str):
+                            valid_type = False
+
+                    if not valid_type:
+                        type_mismatches += 1
+                        if type_mismatches <= 3:
+                            errors.append(
+                                f"Type mismatch on column '{col_name}': expected {expected_type}, "
+                                f"found value '{val}' (type {type(val).__name__}) at row #{row_idx + 1}."
+                            )
+
+    is_valid = len(errors) == 0
+    return {
+        "valid": is_valid,
+        "status": "passed" if is_valid else "failed",
+        "rows": total_rows,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
 def validate_dataframe(
-    df: pd.DataFrame,
+    df: Any,
     required_columns: list[str] | None = None,
     primary_key: str | list[str] | None = None,
     expected_dtypes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
-    Validates an in-memory Pandas DataFrame prior to loading into the target database.
+    Backward-compatibility wrapper delegating to pure Python validate_records.
     """
-    errors: list[str] = []
-    warnings: list[str] = []
-
     if df is None:
         return {
             "valid": False,
@@ -237,41 +386,10 @@ def validate_dataframe(
             "warnings": [],
         }
 
-    row_count = len(df)
-
-    if required_columns:
-        resolved_cols = [_resolve_col(df, c) for c in required_columns]
-        missing_columns = [required_columns[i] for i, c in enumerate(resolved_cols) if c not in df.columns]
-        if missing_columns:
-            errors.append(f"Missing required column(s): {missing_columns}. DataFrame columns: {list(df.columns)}")
-
-    if primary_key:
-        pk_cols = [primary_key] if isinstance(primary_key, str) else list(primary_key)
-        resolved_pk_cols = [_resolve_col(df, c) for c in pk_cols]
-        existing_pk_cols = [c for c in resolved_pk_cols if c in df.columns]
-        if existing_pk_cols and len(existing_pk_cols) == len(pk_cols):
-            duplicates = df.duplicated(subset=existing_pk_cols).sum()
-            if duplicates:
-                errors.append(f"Duplicate primary key values found on {existing_pk_cols}: {duplicates} duplicate row(s)")
-            null_pks = df[existing_pk_cols].isna().any(axis=1).sum()
-            if null_pks:
-                errors.append(f"Primary key column(s) {existing_pk_cols} contain {null_pks} null value(s)")
-
-    if expected_dtypes:
-        for col, expected_type in expected_dtypes.items():
-            resolved = _resolve_col(df, col)
-            if resolved in df.columns:
-                actual = str(df[resolved].dtype)
-                if expected_type in ("numeric", "int", "float") and not pd.api.types.is_numeric_dtype(df[resolved]):
-                    errors.append(f"Column '{col}' expected {expected_type} but found {actual}")
-                elif expected_type == "string" and not pd.api.types.is_string_dtype(df[resolved]):
-                    warnings.append(f"Column '{col}' expected string but found {actual}")
-
-    is_valid = len(errors) == 0
-    return {
-        "valid": is_valid,
-        "status": "passed" if is_valid else "failed",
-        "rows": row_count,
-        "errors": errors,
-        "warnings": warnings,
-    }
+    records = df.to_dict(orient="records") if hasattr(df, "to_dict") else list(df)
+    return validate_records(
+        records=records,
+        required_columns=required_columns,
+        primary_key=primary_key,
+        expected_dtypes=expected_dtypes,
+    )
